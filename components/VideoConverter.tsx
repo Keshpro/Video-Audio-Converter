@@ -28,18 +28,17 @@ function formatBytes(bytes: number) {
 export default function VideoConverter() {
   const [file, setFile] = useState<File | null>(null);
   const [quality, setQuality] = useState("320");
-
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState("");
-
   const [converting, setConverting] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState("");
-
   const [error, setError] = useState("");
 
-  const ffmpegRef = useRef(new FFmpeg());
+  // IMPORTANT:
+  // Do not create FFmpeg here.
+  // It must only be created inside the browser.
+  const ffmpegRef = useRef<FFmpeg | null>(null);
   const loadedRef = useRef(false);
-
   const inputRef = useRef<HTMLInputElement>(null);
 
   const selectFile = (selectedFile?: File) => {
@@ -78,12 +77,23 @@ export default function VideoConverter() {
     }
   };
 
-  const loadFFmpeg = async () => {
-    if (loadedRef.current) return;
+  const loadFFmpeg = async (): Promise<FFmpeg> => {
+    // If already created + loaded, reuse it.
+    if (ffmpegRef.current && loadedRef.current) {
+      return ffmpegRef.current;
+    }
 
-    const ffmpeg = ffmpegRef.current;
+    // Safety check.
+    if (typeof window === "undefined") {
+      throw new Error(
+        "FFmpeg can only run inside the browser."
+      );
+    }
 
     setStatus("Loading converter...");
+
+    // Create FFmpeg ONLY here.
+    const ffmpeg = new FFmpeg();
 
     const baseURL =
       "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
@@ -100,7 +110,10 @@ export default function VideoConverter() {
       ),
     });
 
+    ffmpegRef.current = ffmpeg;
     loadedRef.current = true;
+
+    return ffmpeg;
   };
 
   const convertVideo = async () => {
@@ -112,10 +125,20 @@ export default function VideoConverter() {
     setConverting(true);
 
     try {
-      await loadFFmpeg();
+      setStatus("Starting converter...");
 
-      const ffmpeg = ffmpegRef.current;
+      // This returns the actual initialized FFmpeg instance.
+      const ffmpeg = await loadFFmpeg();
 
+      setStatus("Preparing video...");
+
+      const extension =
+        file.name.split(".").pop()?.toLowerCase() || "mp4";
+
+      const inputName = `input.${extension}`;
+      const outputName = "output.mp3";
+
+      // Progress listener
       ffmpeg.on("progress", ({ progress }) => {
         const value = Math.min(
           100,
@@ -129,14 +152,7 @@ export default function VideoConverter() {
         }
       });
 
-      const extension =
-        file.name.split(".").pop()?.toLowerCase() || "mp4";
-
-      const inputName = `input.${extension}`;
-      const outputName = "output.mp3";
-
-      setStatus("Preparing video...");
-
+      // Write selected video into FFmpeg virtual filesystem.
       await ffmpeg.writeFile(
         inputName,
         await fetchFile(file)
@@ -144,22 +160,22 @@ export default function VideoConverter() {
 
       setStatus("Extracting audio...");
 
+      // Extract audio and encode to MP3.
       await ffmpeg.exec([
         "-i",
         inputName,
-
         "-vn",
-
         "-codec:a",
         "libmp3lame",
-
         "-b:a",
         `${quality}k`,
-
         outputName,
       ]);
 
-      const outputData = await ffmpeg.readFile(outputName);
+      setStatus("Creating MP3 file...");
+
+      const outputData =
+        await ffmpeg.readFile(outputName);
 
       const blob = new Blob(
         [outputData as BlobPart],
@@ -171,21 +187,29 @@ export default function VideoConverter() {
       const url = URL.createObjectURL(blob);
 
       setDownloadUrl(url);
-
       setProgress(100);
       setStatus("Conversion complete!");
 
+      // Clean temporary FFmpeg files.
       try {
         await ffmpeg.deleteFile(inputName);
         await ffmpeg.deleteFile(outputName);
-      } catch {
-        console.log("Temporary file cleanup skipped.");
+      } catch (cleanupError) {
+        console.warn(
+          "Temporary FFmpeg cleanup skipped:",
+          cleanupError
+        );
       }
-    } catch (err) {
-      console.error(err);
+    } catch (conversionError) {
+      console.error(
+        "FFmpeg conversion error:",
+        conversionError
+      );
 
       setError(
-        "Conversion failed. Try another video format or a smaller video."
+        conversionError instanceof Error
+          ? `Conversion failed: ${conversionError.message}`
+          : "Conversion failed. Please try another video."
       );
 
       setProgress(0);
@@ -219,7 +243,9 @@ export default function VideoConverter() {
       {!file ? (
         <div
           className="drop-zone"
-          onClick={() => inputRef.current?.click()}
+          onClick={() =>
+            inputRef.current?.click()
+          }
           onDragOver={(event) => {
             event.preventDefault();
           }}
@@ -237,7 +263,9 @@ export default function VideoConverter() {
             type="file"
             accept="video/*,.mkv,.avi,.mov,.flv,.wmv,.webm,.m4v,.mpeg,.mpg,.3gp"
             onChange={(event) =>
-              selectFile(event.target.files?.[0])
+              selectFile(
+                event.target.files?.[0]
+              )
             }
           />
 
@@ -247,7 +275,9 @@ export default function VideoConverter() {
 
           <h2>Drop your video here</h2>
 
-          <p>or select a video from your device</p>
+          <p>
+            or select a video from your device
+          </p>
 
           <button
             className="choose-button"
@@ -264,10 +294,13 @@ export default function VideoConverter() {
           </button>
 
           <small>
-            MP4 • MOV • MKV • AVI • WEBM • MPEG • M4V • 3GP
+            MP4 • MOV • MKV • AVI • WEBM • MPEG •
+            M4V • 3GP
           </small>
 
-          <small>Maximum recommended size: 500 MB</small>
+          <small>
+            Maximum recommended size: 500 MB
+          </small>
         </div>
       ) : (
         <>
@@ -279,13 +312,17 @@ export default function VideoConverter() {
             <div className="file-info">
               <strong>{file.name}</strong>
 
-              <span>{formatBytes(file.size)}</span>
+              <span>
+                {formatBytes(file.size)}
+              </span>
             </div>
 
             {!converting && (
               <button
+                type="button"
                 className="remove-button"
                 onClick={removeFile}
+                aria-label="Remove video"
               >
                 <X size={20} />
               </button>
@@ -298,47 +335,68 @@ export default function VideoConverter() {
                 <div className="quality-header">
                   <div>
                     <Music size={18} />
-                    <strong>MP3 Quality</strong>
+
+                    <strong>
+                      MP3 Quality
+                    </strong>
                   </div>
 
-                  <span>{quality} kbps</span>
+                  <span>
+                    {quality} kbps
+                  </span>
                 </div>
 
                 <div className="quality-buttons">
-                  {["128", "192", "256", "320"].map(
-                    (bitrate) => (
-                      <button
-                        key={bitrate}
-                        disabled={converting}
-                        className={
-                          quality === bitrate
-                            ? "quality-active"
-                            : ""
-                        }
-                        onClick={() =>
-                          setQuality(bitrate)
-                        }
-                      >
-                        {bitrate}
+                  {[
+                    "128",
+                    "192",
+                    "256",
+                    "320",
+                  ].map((bitrate) => (
+                    <button
+                      type="button"
+                      key={bitrate}
+                      disabled={converting}
+                      className={
+                        quality === bitrate
+                          ? "quality-active"
+                          : ""
+                      }
+                      onClick={() =>
+                        setQuality(bitrate)
+                      }
+                    >
+                      {bitrate}
 
-                        <small> kbps</small>
-                      </button>
-                    )
-                  )}
+                      <small>
+                        {" "}
+                        kbps
+                      </small>
+                    </button>
+                  ))}
                 </div>
 
                 <div className="quality-label">
-                  <span>Smaller file</span>
-                  <span>Best quality</span>
+                  <span>
+                    Smaller file
+                  </span>
+
+                  <span>
+                    Best quality
+                  </span>
                 </div>
               </div>
 
               {converting && (
                 <div className="progress-area">
                   <div className="progress-text">
-                    <span>{status}</span>
+                    <span>
+                      {status}
+                    </span>
 
-                    <span>{progress}%</span>
+                    <span>
+                      {progress}%
+                    </span>
                   </div>
 
                   <div className="progress-background">
@@ -353,6 +411,7 @@ export default function VideoConverter() {
               )}
 
               <button
+                type="button"
                 className="convert-button"
                 onClick={convertVideo}
                 disabled={converting}
@@ -364,7 +423,8 @@ export default function VideoConverter() {
                       className="spinner"
                     />
 
-                    Converting...
+                    {status ||
+                      "Converting..."}
                   </>
                 ) : (
                   <>
@@ -386,13 +446,19 @@ export default function VideoConverter() {
               <h2>MP3 Ready!</h2>
 
               <p>
-                {file.name.replace(/\.[^/.]+$/, "")}
+                {file.name.replace(
+                  /\.[^/.]+$/,
+                  ""
+                )}
                 .mp3
               </p>
 
-              <span>{quality} kbps MP3</span>
+              <span>
+                {quality} kbps MP3
+              </span>
 
               <button
+                type="button"
                 className="download-button"
                 onClick={downloadMP3}
               >
@@ -402,6 +468,7 @@ export default function VideoConverter() {
               </button>
 
               <button
+                type="button"
                 className="another-button"
                 onClick={removeFile}
               >
